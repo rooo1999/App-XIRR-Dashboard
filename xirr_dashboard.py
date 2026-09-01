@@ -342,7 +342,7 @@ def build_excel(summary: dict, txns: pd.DataFrame, breakdown_df: pd.DataFrame,
 # UI
 # ----------------------------------------------------------------------------
 
-st.title("📊 Portfolio XIRR Dashboard — vs Nifty 50")
+st.title("📊 Portfolio XIRR Dashboard vs Nifty 50")
 st.caption(
     "Upload your transaction report to calculate money-weighted returns (XIRR) "
     "and see how the same cash flows would have performed if invested in the "
