@@ -205,8 +205,15 @@ def fetch_benchmark_series(start: datetime, end: datetime):
         progress=False,
         auto_adjust=False,
     )
-    if data.empty:
-        return None
+    if data is None or data.empty:
+        raise ValueError(
+            f"Yahoo Finance returned no data for {BENCHMARK_TICKER} between "
+            f"{start:%d-%b-%Y} and {end:%d-%b-%Y}. This is often Yahoo "
+            "rate-limiting or blocking requests from a cloud server's IP — "
+            "try again in a bit, or upload a Nifty 50 CSV manually below."
+        )
+    if "Close" not in data.columns:
+        raise ValueError(f"Unexpected response shape from yfinance (columns: {list(data.columns)}).")
     close = data["Close"]
     if isinstance(close, pd.DataFrame):  # yfinance sometimes returns multi-col
         close = close.iloc[:, 0]
@@ -214,6 +221,26 @@ def fetch_benchmark_series(start: datetime, end: datetime):
     full_range = pd.date_range(close.index.min(), close.index.max(), freq="D")
     series = close.reindex(full_range).ffill().bfill()
     return series
+
+
+def parse_manual_benchmark_csv(file_bytes: bytes):
+    """Fallback path: user-supplied CSV with Date + Close (or similar) columns,
+    e.g. exported from niftyindices.com or NSE, for when yfinance is unreachable."""
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = [c.strip().lower() for c in df.columns]
+    date_col = next((c for c in df.columns if "date" in c), None)
+    price_col = next((c for c in df.columns if c in ("close", "closing price", "price", "nav")), None)
+    if date_col is None or price_col is None:
+        raise ValueError(
+            f"Couldn't find Date/Close columns in that CSV (found: {list(df.columns)}). "
+            "Expected a column with 'date' in the name and one named Close/Price/NAV."
+        )
+    df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=[date_col]).sort_values(date_col)
+    df[price_col] = df[price_col].apply(clean_num)
+    series = df.set_index(date_col)[price_col]
+    full_range = pd.date_range(series.index.min(), series.index.max(), freq="D")
+    return series.reindex(full_range).ffill().bfill()
 
 
 def price_on(series: pd.Series, date: datetime):
@@ -342,7 +369,7 @@ def build_excel(summary: dict, txns: pd.DataFrame, breakdown_df: pd.DataFrame,
 # UI
 # ----------------------------------------------------------------------------
 
-st.title("📊 Portfolio XIRR Dashboard vs Nifty 50")
+st.title("📊 Portfolio XIRR Dashboard — vs Nifty 50")
 st.caption(
     "Upload your transaction report to calculate money-weighted returns (XIRR) "
     "and see how the same cash flows would have performed if invested in the "
@@ -441,7 +468,20 @@ if run_benchmark:
                 series = fetch_benchmark_series(external_txns["Date_parsed"].min(), as_of_date)
             except Exception as e:
                 series = None
-                st.error(f"Could not fetch Nifty 50 data: {e}")
+                st.error(f"Could not fetch Nifty 50 data automatically: {e}")
+
+        if series is None:
+            manual_csv = st.file_uploader(
+                "Or upload a Nifty 50 historical CSV manually (columns: Date, Close)",
+                type=["csv"], key="manual_benchmark_csv",
+            )
+            if manual_csv is not None:
+                try:
+                    series = parse_manual_benchmark_csv(manual_csv.getvalue())
+                    st.success("Loaded Nifty 50 prices from your uploaded file.")
+                except Exception as e:
+                    st.error(f"Could not read that file: {e}")
+
         if series is not None:
             # Only real external cash flows get replayed into the benchmark —
             # a Switch never added or removed money from the portfolio, so it
