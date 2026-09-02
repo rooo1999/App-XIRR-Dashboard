@@ -3,5 +3,6 @@ pandas
 numpy
 scipy
 yfinance
+requests
 xlsxwriter
 openpyxl
