@@ -6,13 +6,16 @@ Date & Time, Type, Amount, <signed cash flow>) and this app will:
 
 1. Clean & parse the transactions
 2. Calculate the portfolio's money-weighted return (XIRR)
-3. Simulate the same cash flows invested in the Nifty 50 index (^NSEI) to
-   get a like-for-like benchmark XIRR
+3. Simulate the same cash flows invested in a Nifty 50 benchmark to get a
+   like-for-like comparison XIRR. Tries, in order: the raw Nifty 50 index
+   (^NSEI via Yahoo Finance) -> UTI Nifty 50 Index Fund - Direct Plan NAV
+   (via the free mfapi.in API, as a real, investable proxy) -> a manually
+   uploaded CSV as a last resort.
 4. Let you download a full Excel workbook (summary + transactions +
    benchmark detail) that anyone can open, no login/tooling required
 
 Run with:  streamlit run xirr_dashboard.py
-Requires:  pip install streamlit pandas numpy scipy yfinance xlsxwriter openpyxl
+Requires:  pip install streamlit pandas numpy scipy yfinance requests xlsxwriter openpyxl
 """
 
 import io
@@ -20,6 +23,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from scipy.optimize import brentq
 
@@ -225,7 +229,8 @@ def fetch_benchmark_series(start: datetime, end: datetime):
 
 def parse_manual_benchmark_csv(file_bytes: bytes):
     """Fallback path: user-supplied CSV with Date + Close (or similar) columns,
-    e.g. exported from niftyindices.com or NSE, for when yfinance is unreachable."""
+    e.g. exported from niftyindices.com or NSE, for when both automatic
+    sources are unreachable."""
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
     date_col = next((c for c in df.columns if "date" in c), None)
@@ -239,6 +244,53 @@ def parse_manual_benchmark_csv(file_bytes: bytes):
     df = df.dropna(subset=[date_col]).sort_values(date_col)
     df[price_col] = df[price_col].apply(clean_num)
     series = df.set_index(date_col)[price_col]
+    full_range = pd.date_range(series.index.min(), series.index.max(), freq="D")
+    return series.reindex(full_range).ffill().bfill()
+
+
+# ----------------------------------------------------------------------------
+# mfapi.in fallback — UTI Nifty 50 Index Fund (Direct Plan) NAV as a proxy.
+# This is a real, investable fund that tracks the Nifty 50, so its NAV
+# already nets out the small tracking error and expense ratio a real
+# investor would have paid — arguably a *more* realistic benchmark than the
+# raw index, and mfapi.in is a free India-specific API that isn't subject
+# to the Yahoo Finance cloud-IP blocking that affects yfinance.
+# ----------------------------------------------------------------------------
+
+MFAPI_BASE = "https://api.mfapi.in"
+UTI_NIFTY50_INCLUDE_HINTS = ["uti", "nifty 50", "direct", "growth"]
+UTI_NIFTY50_EXCLUDE_HINTS = ["next 50", "etf"]
+
+
+@st.cache_data(show_spinner=False)
+def find_uti_nifty50_scheme_code():
+    """Looks up the scheme code for 'UTI Nifty 50 Index Fund - Direct Plan -
+    Growth' via mfapi.in's search endpoint, rather than hard-coding a code
+    that could change or vary by source."""
+    resp = requests.get(f"{MFAPI_BASE}/mf/search", params={"q": "UTI Nifty 50 Index Fund"}, timeout=15)
+    resp.raise_for_status()
+    results = resp.json()
+    for r in results:
+        name = r.get("schemeName", "").lower()
+        if all(h in name for h in UTI_NIFTY50_INCLUDE_HINTS) and not any(h in name for h in UTI_NIFTY50_EXCLUDE_HINTS):
+            return r["schemeCode"], r["schemeName"]
+    raise ValueError("Could not find 'UTI Nifty 50 Index Fund - Direct Plan - Growth' via mfapi.in search.")
+
+
+@st.cache_data(show_spinner=False)
+def fetch_mfapi_nav_series(scheme_code: int):
+    """Daily NAV history for a mutual fund scheme from mfapi.in, forward-
+    filled across non-NAV days (weekends/holidays)."""
+    resp = requests.get(f"{MFAPI_BASE}/mf/{scheme_code}", timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("status") != "SUCCESS" or not payload.get("data"):
+        raise ValueError(f"mfapi.in returned no NAV data for scheme {scheme_code}.")
+    df = pd.DataFrame(payload["data"])
+    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
+    df["nav"] = df["nav"].astype(float)
+    df = df.sort_values("date")
+    series = df.set_index("date")["nav"]
     full_range = pd.date_range(series.index.min(), series.index.max(), freq="D")
     return series.reindex(full_range).ffill().bfill()
 
@@ -320,6 +372,8 @@ def build_excel(summary: dict, txns: pd.DataFrame, breakdown_df: pd.DataFrame,
                 ("Nifty 50 Benchmark XIRR", summary["benchmark_xirr"], pct_fmt),
                 ("Alpha vs Nifty 50 (XIRR pts)", summary["portfolio_xirr"] - summary["benchmark_xirr"], pct_fmt),
             ]
+            if summary.get("benchmark_source"):
+                rows.append(("Benchmark Source", summary["benchmark_source"], None))
         r = 2
         for label, val, fmt in rows:
             ws.write(r, 0, label, bold)
@@ -455,40 +509,55 @@ if not unknown_txns.empty:
 st.subheader("Nifty 50 benchmark")
 run_benchmark = st.checkbox("Compare against Nifty 50", value=True)
 
-benchmark_xirr = benchmark_value = None
+benchmark_xirr = benchmark_value = benchmark_source = None
 bench_detail = None
 
 if run_benchmark:
-    if not YF_AVAILABLE:
-        st.error("`yfinance` is not installed in this environment. Run "
-                 "`pip install yfinance` and restart the app to enable benchmarking.")
-    else:
-        with st.spinner("Fetching Nifty 50 historical prices..."):
+    series = None
+
+    if YF_AVAILABLE:
+        with st.spinner("Fetching Nifty 50 historical prices (Yahoo Finance)..."):
             try:
                 series = fetch_benchmark_series(external_txns["Date_parsed"].min(), as_of_date)
+                benchmark_source = "Nifty 50 Index (^NSEI, Yahoo Finance)"
             except Exception as e:
-                series = None
-                st.error(f"Could not fetch Nifty 50 data automatically: {e}")
+                st.warning(f"Yahoo Finance fetch failed ({e}). Trying UTI Nifty 50 Index "
+                           "Fund NAV via mfapi.in as a proxy instead...")
+    else:
+        st.info("`yfinance` isn't installed — trying UTI Nifty 50 Index Fund NAV "
+                "via mfapi.in as a proxy instead.")
 
-        if series is None:
-            manual_csv = st.file_uploader(
-                "Or upload a Nifty 50 historical CSV manually (columns: Date, Close)",
-                type=["csv"], key="manual_benchmark_csv",
-            )
-            if manual_csv is not None:
-                try:
-                    series = parse_manual_benchmark_csv(manual_csv.getvalue())
-                    st.success("Loaded Nifty 50 prices from your uploaded file.")
-                except Exception as e:
-                    st.error(f"Could not read that file: {e}")
+    if series is None:
+        with st.spinner("Fetching UTI Nifty 50 Index Fund NAV (mfapi.in)..."):
+            try:
+                scheme_code, scheme_name = find_uti_nifty50_scheme_code()
+                series = fetch_mfapi_nav_series(scheme_code)
+                benchmark_source = f"{scheme_name} NAV (mfapi.in, proxy for Nifty 50)"
+                st.info(f"Using **{scheme_name}** NAV as a Nifty 50 proxy (via mfapi.in), "
+                        "since it's a real, investable fund tracking the index.")
+            except Exception as e:
+                st.error(f"Could not fetch a Nifty 50 proxy via mfapi.in either: {e}")
 
-        if series is not None:
-            # Only real external cash flows get replayed into the benchmark —
-            # a Switch never added or removed money from the portfolio, so it
-            # shouldn't add or remove benchmark units either.
-            benchmark_xirr, benchmark_value, bench_detail = simulate_benchmark(
-                external_txns, current_value, as_of_date, series
-            )
+    if series is None:
+        manual_csv = st.file_uploader(
+            "Or upload a Nifty 50 / index-fund historical CSV manually (columns: Date, Close/NAV)",
+            type=["csv"], key="manual_benchmark_csv",
+        )
+        if manual_csv is not None:
+            try:
+                series = parse_manual_benchmark_csv(manual_csv.getvalue())
+                benchmark_source = "Manually uploaded CSV"
+                st.success("Loaded benchmark prices from your uploaded file.")
+            except Exception as e:
+                st.error(f"Could not read that file: {e}")
+
+    if series is not None:
+        # Only real external cash flows get replayed into the benchmark —
+        # a Switch never added or removed money from the portfolio, so it
+        # shouldn't add or remove benchmark units either.
+        benchmark_xirr, benchmark_value, bench_detail = simulate_benchmark(
+            external_txns, current_value, as_of_date, series
+        )
 
 # --- Metrics ---
 st.subheader("Results")
@@ -503,6 +572,8 @@ m5.metric("Portfolio XIRR", f"{portfolio_xirr*100:,.2f}%" if not np.isnan(portfo
 if benchmark_xirr is not None:
     m6.metric("Nifty 50 Benchmark XIRR", f"{benchmark_xirr*100:,.2f}%",
               delta=f"{(portfolio_xirr-benchmark_xirr)*100:,.2f} pts vs benchmark")
+    if benchmark_source:
+        m6.caption(f"Source: {benchmark_source}")
 else:
     m6.metric("Nifty 50 Benchmark XIRR", "—")
 if platform_xirr is not None:
@@ -550,6 +621,7 @@ summary = {
     "platform_xirr": platform_xirr,
     "benchmark_xirr": benchmark_xirr,
     "benchmark_value": benchmark_value,
+    "benchmark_source": benchmark_source,
 }
 excel_bytes = build_excel(summary, txns, breakdown_df, group_label, bench_detail)
 
